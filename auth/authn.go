@@ -2,7 +2,6 @@ package auth
 
 import (
 	"encoding/base32"
-	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -45,7 +44,6 @@ var (
 	Authority *authority.Authority
 
 	authEnabled      bool
-	signingKeyBase64 []byte
 	signingKeyBase32 string
 	tokenStore       TokenStore
 )
@@ -79,17 +77,16 @@ func validateAccessToken(claims *ScopedClaims) (bool, error) {
 }
 
 func Init() {
-	authEnabled = viper.GetBool("dev.authenabled")
+	authEnabled = viper.GetBool("auth.enabled")
 	if !authEnabled {
 		banzaiUtils.LogInfo(banzaiConstants.TagAuth, "Authentication is disabled.")
 		return
 	}
 
-	signingKey := viper.GetString("dev.tokensigningkey")
+	signingKey := viper.GetString("auth.tokensigningkey")
 	if signingKey == "" {
 		panic("Token signing key is missing from configuration")
 	}
-	signingKeyBase64, _ = base64.URLEncoding.DecodeString(signingKey)
 	signingKeyBase32 = base32.StdEncoding.EncodeToString([]byte(signingKey))
 
 	RedirectBack = redirect_back.New(&redirect_back.Config{
@@ -104,18 +101,21 @@ func Init() {
 		UserModel:  User{},
 		UserStorer: BanzaiUserStorer{signingKeyBase32: signingKeyBase32, droneDB: initDroneDatabase()},
 		ViewPaths:  []string{"github.com/banzaicloud/pipeline/views"},
-		SessionStorer: &BanzaiSessionStorer{auth.SessionStorer{
-			SessionName:    "_auth_session",
-			SessionManager: manager.SessionManager,
-			SigningMethod:  jwt.SigningMethodHS256,
-			SignedString:   signingKeyBase32,
-		}},
+		SessionStorer: &BanzaiSessionStorer{
+			SessionStorer: auth.SessionStorer{
+				SessionName:    "_auth_session",
+				SessionManager: manager.SessionManager,
+				SigningMethod:  jwt.SigningMethodHS256,
+				SignedString:   signingKeyBase32,
+			},
+			SignedStringBytes: []byte(signingKeyBase32),
+		},
 	})
 
 	githubProvider := github.New(&github.Config{
 		// ClientID and ClientSecret is validated inside github.New()
-		ClientID:     viper.GetString("dev.clientid"),
-		ClientSecret: viper.GetString("dev.clientsecret"),
+		ClientID:     viper.GetString("auth.clientid"),
+		ClientSecret: viper.GetString("auth.clientsecret"),
 
 		// The same as Drone's scopes
 		Scopes: []string{
@@ -234,6 +234,7 @@ func Auth0Handler(c *gin.Context) {
 
 type BanzaiSessionStorer struct {
 	auth.SessionStorer
+	SignedStringBytes []byte
 }
 
 func (sessionStorer *BanzaiSessionStorer) Update(w http.ResponseWriter, req *http.Request, claims *claims.Claims) error {
@@ -249,15 +250,16 @@ func (sessionStorer *BanzaiSessionStorer) Update(w http.ResponseWriter, req *htt
 		return fmt.Errorf("Can't get current user")
 	}
 	droneClaims := &DroneClaims{Claims: claims, Type: DroneSessionCookieType, Text: currentUser.Login}
-	tokenToken := sessionStorer.SignedTokenWithDrone(droneClaims)
+	tokenToken, err := sessionStorer.SignedTokenWithDrone(droneClaims)
+	if err != nil {
+		return err
+	}
 	SetCookie(w, req, DroneSessionCookie, tokenToken)
 	return nil
 }
 
 // SignedToken generate signed token with Claims
-func (sessionStorer *BanzaiSessionStorer) SignedTokenWithDrone(claims *DroneClaims) string {
+func (sessionStorer *BanzaiSessionStorer) SignedTokenWithDrone(claims *DroneClaims) (string, error) {
 	token := jwt.NewWithClaims(sessionStorer.SigningMethod, claims)
-	println("secret:", sessionStorer.SignedString)
-	signedToken, _ := token.SignedString([]byte(sessionStorer.SignedString))
-	return signedToken
+	return token.SignedString(sessionStorer.SignedStringBytes)
 }
